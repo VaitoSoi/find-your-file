@@ -1,0 +1,24 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "aiosqlite>=0.22.0",
+    "fastapi[standard]>=0.124.4",
+    "minio>=7.2.20",
+    "sqlmodel>=0.0.27",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Enables import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["lib", "enums", "hash", "errors", "db"]
+combine-as-imports = true
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
