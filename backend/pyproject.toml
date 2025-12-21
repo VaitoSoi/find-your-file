@@ -8,6 +8,7 @@ dependencies = [
     "aiosqlite>=0.22.0",
     "fastapi[standard]>=0.124.4",
     "minio>=7.2.20",
+    "redis[hiredis]>=7.1.0",
     "sqlmodel>=0.0.27",
 ]
 
