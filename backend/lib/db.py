@@ -196,7 +196,7 @@ class Session(SQLModel, table=True):
 
     id: str = SQLField(default_factory=lambda: uuid4().__str__(), primary_key=True)
 
-    user_id: str = SQLField(foreign_key="user.id")
+    user_id: str = SQLField(foreign_key="user.id", ondelete="CASCADE")
     user: User = Relationship()
 
     valid_until: datetime
