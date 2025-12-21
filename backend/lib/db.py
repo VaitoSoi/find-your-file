@@ -23,8 +23,14 @@ from sqlmodel import (
 
 from .cache import cache, invalidate, update as update_cache
 from .env import DB_URL, MAX_SESSION_TIME
-from .execption import EntryNotFound, SessionNotFound, SessionTooLong, UserNotFound
-from .hash import hash
+from .execption import (
+    EntryNotFound,
+    NotAuthor,
+    SessionNotFound,
+    SessionTooLong,
+    UserNotFound,
+)
+from .hash import hash, verify
 
 """
 Object-related models
@@ -79,10 +85,10 @@ class Entry(SQLModel, table=True):
     is_deleted: bool = SQLField(default=False)
     is_deleted_since: Optional[datetime] = SQLField(default=None)
 
-    view: EntryPermission = SQLField(
+    permission: EntryPermission = SQLField(
         default=EntryPermission.private, sa_column=SQLEnum(EntryPermission)
     )
-    view_inclusive: list[str] = SQLField(
+    permission_inclusive: list[str] = SQLField(
         default=[], sa_column=Column(JSON)
     )  # list of user can see this
 
@@ -104,8 +110,8 @@ class SlicedEntry(BaseModel):
     is_deleted: bool = PydanticField(default=False)
     is_deleted_since: Optional[datetime] = PydanticField(default=None)
 
-    view: EntryPermission
-    view_inclusive: list[str]
+    permission: EntryPermission
+    permission_inclusive: list[str]
 
     created_at: datetime
     updated_at: datetime
@@ -114,8 +120,8 @@ class SlicedEntry(BaseModel):
 class UpdateEntry(BaseModel):
     name: Optional[str]
     parent_id: Optional[str]
-    view: Optional[EntryPermission]
-    view_inclusive: Optional[list[str]]
+    permission: Optional[EntryPermission]
+    permission_inclusive: Optional[list[str]]
 
 
 class Transaction(SQLModel, table=True):
@@ -151,7 +157,7 @@ class User(SQLModel, table=True):
     __tablename__ = "user"  # pyright: ignore[reportAssignmentType]
 
     id: str = SQLField(default_factory=lambda: uuid4().__str__(), primary_key=True)
-    username: str
+    username: str = SQLField(unique=True)
     display_name: str
     password: str  # Hashed
 
@@ -264,8 +270,8 @@ def format_entry(entry: Entry):
         parent_id=entry.parent_id,
         is_deleted=entry.is_deleted,
         is_deleted_since=entry.is_deleted_since,
-        view=entry.view,
-        view_inclusive=entry.view_inclusive,
+        permission=entry.permission,
+        permission_inclusive=entry.permission_inclusive,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
     )
@@ -376,8 +382,11 @@ async def _update_entry(
         entry = await _get_entry(id, session)
 
         for key, val in data.model_dump().items():
-            if val:
-                setattr(entry, key, val)
+            if val is None:
+                continue
+            if key == "permission" and actor_id != entry.author_id:
+                raise NotAuthor()
+            setattr(entry, key, val)
 
         transaction = Transaction(
             entry_id=id, action=TransactionAction.modify, actor_id=actor_id
@@ -533,6 +542,18 @@ async def _get_user(id: str, _session: Optional[AsyncSession] = None):
     return await create_session_and_run(_inner, _session)
 
 
+async def _get_user_by_username(username: str, _session: Optional[AsyncSession] = None):
+    @cache(f"User#username:{username}", User)
+    async def _inner(session: AsyncSession):
+        statement = select(User).where(User.username == username)
+        user = (await session.execute(statement)).scalar()
+        if not user:
+            raise UserNotFound()
+        return user
+
+    return await create_session_and_run(_inner, _session)
+
+
 async def get_user(id: str, _session: Optional[AsyncSession] = None):
     return format_user(await _get_user(id, _session))
 
@@ -597,6 +618,63 @@ async def delete_user(id: str, _session: Optional[AsyncSession] = None):
     return await create_session_and_run(_inner, _session)
 
 
+# Utils
+async def login(username: str, password: str, session: Optional[AsyncSession] = None):
+    user = await _get_user_by_username(username, session)
+    return verify(user.password, password)
+
+
+async def can_see_entry(
+    user_id: str, entry_id: str, session: Optional[AsyncSession] = None
+):
+    entry = await _get_entry(entry_id, session)
+
+    if (
+        entry.permission == EntryPermission.public
+        or entry.permission == EntryPermission.public_readonly
+    ):
+        return True
+    elif entry.permission == EntryPermission.private:
+        return False
+    elif (
+        entry.permission == EntryPermission.inclusive
+        or entry.permission == EntryPermission.inclusive_readonly
+    ):
+        user = await _get_user(user_id, session)
+        if user.id in entry.permission_inclusive:
+            return True
+        else:
+            return False
+    else:
+        return False
+
+
+async def can_modify_entry(
+    user_id: str, 
+    entry_id: str, 
+    session: Optional[AsyncSession] = None
+):
+    entry = await _get_entry(entry_id, session)
+
+    if (
+        entry.permission == EntryPermission.public_readonly
+        or entry.permission == EntryPermission.inclusive_readonly
+        or entry.permission == EntryPermission.private
+    ):
+        return False
+    elif (
+        entry.permission == EntryPermission.inclusive
+        or entry.permission == EntryPermission.public
+    ):
+        user = await _get_user(user_id, session)
+        if user.id in entry.permission_inclusive:
+            return True
+        else:
+            return False
+    else:
+        return False
+
+
 """
 Session
 """
@@ -642,11 +720,9 @@ async def create_session(
 ):
     return format_session(await _create_session(user_id, valid_until, _session))
 
+
 # Get
-async def _get_user_session(
-    id: str,
-    _session: Optional[AsyncSession] = None
-):
+async def _get_user_session(id: str, _session: Optional[AsyncSession] = None):
     @cache(f"Session:{id}", Session)
     async def _inner(_session: AsyncSession):
         statement = select(Session).where(Session.id == id)
@@ -654,14 +730,13 @@ async def _get_user_session(
         if not session:
             raise SessionNotFound()
         return session
-    
+
     return await create_session_and_run(_inner, _session)
 
-async def get_user_session(
-    id: str,
-    _session: Optional[AsyncSession] = None
-):
+
+async def get_user_session(id: str, _session: Optional[AsyncSession] = None):
     return format_session(await _get_user_session(id, _session))
+
 
 # Delete
 async def delete_session(id: str, _session: Optional[AsyncSession] = None):
@@ -671,4 +746,3 @@ async def delete_session(id: str, _session: Optional[AsyncSession] = None):
         await invalidate(f"Session:{id}")
 
     return await create_session_and_run(_inner, _session)
-
