@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum as PyEnum
 from typing import Awaitable, Callable, Optional, TypeVar
 from uuid import uuid4
@@ -22,8 +22,9 @@ from sqlmodel import (
 )
 
 from .cache import cache, invalidate, update as update_cache
-from .env import DB_URL
-from .execption import EntryNotFound, UserNotFound
+from .env import DB_URL, MAX_SESSION_TIME
+from .execption import EntryNotFound, SessionNotFound, SessionTooLong, UserNotFound
+from .hash import hash
 
 """
 Object-related models
@@ -78,7 +79,9 @@ class Entry(SQLModel, table=True):
     is_deleted: bool = SQLField(default=False)
     is_deleted_since: Optional[datetime] = SQLField(default=None)
 
-    view: EntryPermission = SQLField(default=EntryPermission.private, sa_column=SQLEnum(EntryPermission))
+    view: EntryPermission = SQLField(
+        default=EntryPermission.private, sa_column=SQLEnum(EntryPermission)
+    )
     view_inclusive: list[str] = SQLField(
         default=[], sa_column=Column(JSON)
     )  # list of user can see this
@@ -153,6 +156,7 @@ class User(SQLModel, table=True):
     password: str  # Hashed
 
     entries: list[Entry] = Relationship(back_populates="author")
+    sessions: list["Session"] = Relationship(back_populates="user")
 
     created_at: datetime = SQLField(default_factory=lambda: datetime.now())
     updated_at: datetime = SQLField(
@@ -174,6 +178,33 @@ class UpdateUser(BaseModel):
     username: str
     display_name: str
     password: str
+
+
+"""
+Session
+"""
+
+
+class Session(SQLModel, table=True):
+    __tablename__ = "session"  # pyright: ignore[reportAssignmentType]
+
+    id: str = SQLField(default_factory=lambda: uuid4().__str__(), primary_key=True)
+
+    user_id: str = SQLField(foreign_key="user.id")
+    user: User = Relationship()
+
+    valid_until: datetime
+    created_at: datetime = SQLField(default_factory=lambda: datetime.now())
+
+
+class SlicedSession(BaseModel):
+    id: str
+
+    user_id: str
+    user: SlicedUser
+
+    valid_until: datetime
+    created_at: datetime
 
 
 """
@@ -307,9 +338,10 @@ async def _add_entry(
     parent_id: Optional[str] = None,
     _session: Optional[AsyncSession] = None,
 ):
-    @update_cache(cache_key=f"Entry:{id}")
+    entry_id = uuid4().__str__()
+
+    @update_cache(cache_key=f"Entry:{entry_id}")
     async def _inner(session: AsyncSession):
-        entry_id = uuid4().__str__()
         entry = Entry(
             id=entry_id, name=name, type=type, author_id=author_id, parent_id=parent_id
         )
@@ -335,8 +367,9 @@ async def add_entry(
     )
 
 
+# Update
 async def _update_entry(
-    id: str, data: UpdateEntry, _session: Optional[AsyncSession] = None
+    id: str, data: UpdateEntry, actor_id: str, _session: Optional[AsyncSession] = None
 ):
     @update_cache(cache_key=f"Entry:{id}")
     async def _inner(session: AsyncSession):
@@ -346,7 +379,11 @@ async def _update_entry(
             if val:
                 setattr(entry, key, val)
 
-        session.add(entry)
+        transaction = Transaction(
+            entry_id=id, action=TransactionAction.modify, actor_id=actor_id
+        )
+
+        session.add_all([entry, transaction])
         await session.commit()
         return entry
 
@@ -354,9 +391,9 @@ async def _update_entry(
 
 
 async def update_entry(
-    id: str, data: UpdateEntry, _session: Optional[AsyncSession] = None
+    id: str, data: UpdateEntry, actor_id: str, _session: Optional[AsyncSession] = None
 ):
-    return format_entry(await _update_entry(id, data, _session))
+    return format_entry(await _update_entry(id, data, actor_id, _session))
 
 
 # Mark delete
@@ -471,6 +508,7 @@ def format_user(user: User):
 
 # Get all
 async def _get_users(_session: Optional[AsyncSession] = None):
+    @cache("Users", list[User])
     async def _inner(session: AsyncSession):
         statement = select(User)
         return list((await session.execute(statement)).scalars().all())
@@ -483,7 +521,8 @@ async def get_users(_session: Optional[AsyncSession] = None):
 
 
 # Get one
-async def _get_user(id: str, _session: Optional[AsyncSession] = None): 
+async def _get_user(id: str, _session: Optional[AsyncSession] = None):
+    @cache(f"User:{id}", User)
     async def _inner(session: AsyncSession):
         statement = select(User).where(User.id == id)
         user = (await session.execute(statement)).scalar()
@@ -493,9 +532,143 @@ async def _get_user(id: str, _session: Optional[AsyncSession] = None):
 
     return await create_session_and_run(_inner, _session)
 
-async def get_user(id: str, _session: Optional[AsyncSession] = None): 
+
+async def get_user(id: str, _session: Optional[AsyncSession] = None):
     return format_user(await _get_user(id, _session))
 
+
+# Add one
+async def _add_user(new_user: UpdateUser, _session: Optional[AsyncSession] = None):
+    user_id = uuid4().__str__()
+
+    @update_cache(f"User:{user_id}")
+    async def _inner(session: AsyncSession):
+        user = User(
+            username=new_user.username,
+            display_name=new_user.display_name,
+            password=hash(new_user.password),
+        )
+        session.add(user)
+        await session.commit()
+        return user
+
+    return await create_session_and_run(_inner, _session)
+
+
+async def add_user(new_user: UpdateUser, _session: Optional[AsyncSession] = None):
+    return format_user(await _add_user(new_user, _session))
+
+
 # Update
-async def _update_user(id: str, data: UpdateUser, _session: Optional[AsyncSession] = None):
-    ...
+async def _update_user(
+    id: str, data: UpdateUser, _session: Optional[AsyncSession] = None
+):
+    @update_cache(f"User:{id}")
+    async def _inner(session: AsyncSession):
+        user = await _get_user(id, session)
+
+        dumped_data = data.model_dump()
+        for key in dumped_data:
+            val = dumped_data[key]
+            if key == "password":
+                val = hash(val)
+            setattr(user, key, val)
+
+        session.add(user)
+        await session.commit()
+        return user
+
+    return await create_session_and_run(_inner, _session)
+
+
+async def update_user(
+    id: str, data: UpdateUser, _session: Optional[AsyncSession] = None
+):
+    return format_user(await _update_user(id, data, _session))
+
+
+# Delete
+async def delete_user(id: str, _session: Optional[AsyncSession] = None):
+    async def _inner(session: AsyncSession):
+        user = await _get_user(id, session)
+        await session.delete(user)
+        await invalidate(f"User:{id}")
+
+    return await create_session_and_run(_inner, _session)
+
+
+"""
+Session
+"""
+
+
+def format_session(session: Session):
+    return SlicedSession(
+        id=session.id,
+        user_id=session.user_id,
+        user=format_user(session.user),
+        valid_until=session.valid_until,
+        created_at=session.created_at,
+    )
+
+
+# Create session
+async def _create_session(
+    user_id: str, valid_until: datetime, _session: Optional[AsyncSession] = None
+):
+    id = uuid4().__str__()
+
+    @update_cache(f"Session:{id}")
+    async def _inner(_session: AsyncSession):
+        if MAX_SESSION_TIME and valid_until > datetime.now() + timedelta(
+            seconds=MAX_SESSION_TIME
+        ):
+            raise SessionTooLong()
+
+        session = Session(
+            id=id,
+            user_id=user_id,
+            valid_until=valid_until,
+        )
+        _session.add(session)
+        await _session.commit()
+        return session
+
+    return await create_session_and_run(_inner, _session)
+
+
+async def create_session(
+    user_id: str, valid_until: datetime, _session: Optional[AsyncSession] = None
+):
+    return format_session(await _create_session(user_id, valid_until, _session))
+
+# Get
+async def _get_user_session(
+    id: str,
+    _session: Optional[AsyncSession] = None
+):
+    @cache(f"Session:{id}", Session)
+    async def _inner(_session: AsyncSession):
+        statement = select(Session).where(Session.id == id)
+        session = (await _session.execute(statement)).scalar()
+        if not session:
+            raise SessionNotFound()
+        return session
+    
+    return await create_session_and_run(_inner, _session)
+
+async def get_user_session(
+    id: str,
+    _session: Optional[AsyncSession] = None
+):
+    return format_session(await _get_user_session(id, _session))
+
+# Delete
+async def delete_session(id: str, _session: Optional[AsyncSession] = None):
+    async def _inner(_session: AsyncSession):
+        session = await _get_user_session(id, _session)
+        await _session.delete(session)
+        await invalidate(f"Session:{id}")
+
+    return await create_session_and_run(_inner, _session)
+
