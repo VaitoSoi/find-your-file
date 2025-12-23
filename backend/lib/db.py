@@ -180,10 +180,16 @@ class SlicedUser(BaseModel):
     updated_at: datetime
 
 
-class UpdateUser(BaseModel):
+class NewUser(BaseModel):
     username: str
     display_name: str
     password: str
+
+
+class UpdateUser(BaseModel):
+    username: Optional[str]
+    display_name: Optional[str]
+    password: Optional[str]
 
 
 """
@@ -294,7 +300,12 @@ async def _get_entries(
     parent_id: Optional[str] = None,
     _session: Optional[AsyncSession] = None,
 ):
-    @cache(cache_key="Entries", base_class=list[Entry])
+    cache_key = "Entries"
+    if all:
+        cache_key += "#all"
+    if parent_id:
+        cache_key += f"#parent={parent_id}"
+    @cache(cache_key=cache_key, base_class=list[Entry])
     async def _inner(session: AsyncSession):
         statement = select(Entry).where(Entry.author_id == author_id)
         if not all:
@@ -495,7 +506,7 @@ async def delete_entry(id: str, actor_id: str, _session: Optional[AsyncSession] 
         session.add(transaction)
         await session.delete(entry)
         await session.commit()
-        await invalidate(f"Entry:{id}")
+        await invalidate(f"Entry:{id}", "Entryies*")
 
     return await create_session_and_run(_inner, _session)
 
@@ -559,7 +570,7 @@ async def get_user(id: str, _session: Optional[AsyncSession] = None):
 
 
 # Add one
-async def _add_user(new_user: UpdateUser, _session: Optional[AsyncSession] = None):
+async def _new_user(new_user: NewUser, _session: Optional[AsyncSession] = None):
     user_id = uuid4().__str__()
 
     @update_cache(f"User:{user_id}")
@@ -576,8 +587,8 @@ async def _add_user(new_user: UpdateUser, _session: Optional[AsyncSession] = Non
     return await create_session_and_run(_inner, _session)
 
 
-async def add_user(new_user: UpdateUser, _session: Optional[AsyncSession] = None):
-    return format_user(await _add_user(new_user, _session))
+async def new_user(new_user: NewUser, _session: Optional[AsyncSession] = None):
+    return format_user(await _new_user(new_user, _session))
 
 
 # Update
@@ -613,7 +624,7 @@ async def delete_user(id: str, _session: Optional[AsyncSession] = None):
     async def _inner(session: AsyncSession):
         user = await _get_user(id, session)
         await session.delete(user)
-        await invalidate(f"User:{id}")
+        await invalidate(f"User:{id}", "Users")
 
     return await create_session_and_run(_inner, _session)
 
@@ -621,7 +632,10 @@ async def delete_user(id: str, _session: Optional[AsyncSession] = None):
 # Utils
 async def login(username: str, password: str, session: Optional[AsyncSession] = None):
     user = await _get_user_by_username(username, session)
-    return verify(user.password, password)
+    if verify(user.password, password):
+        return user
+    else:
+        return None
 
 
 async def can_see_entry(
@@ -650,9 +664,7 @@ async def can_see_entry(
 
 
 async def can_modify_entry(
-    user_id: str, 
-    entry_id: str, 
-    session: Optional[AsyncSession] = None
+    user_id: str, entry_id: str, session: Optional[AsyncSession] = None
 ):
     entry = await _get_entry(entry_id, session)
 
@@ -692,21 +704,19 @@ def format_session(session: Session):
 
 # Create session
 async def _create_session(
-    user_id: str, valid_until: datetime, _session: Optional[AsyncSession] = None
+    user_id: str, expire_time: timedelta, _session: Optional[AsyncSession] = None
 ):
     id = uuid4().__str__()
 
     @update_cache(f"Session:{id}")
     async def _inner(_session: AsyncSession):
-        if MAX_SESSION_TIME and valid_until > datetime.now() + timedelta(
-            seconds=MAX_SESSION_TIME
-        ):
+        if MAX_SESSION_TIME and expire_time > timedelta(seconds=MAX_SESSION_TIME):
             raise SessionTooLong()
 
         session = Session(
             id=id,
             user_id=user_id,
-            valid_until=valid_until,
+            valid_until=datetime.now() + expire_time,
         )
         _session.add(session)
         await _session.commit()
@@ -716,9 +726,9 @@ async def _create_session(
 
 
 async def create_session(
-    user_id: str, valid_until: datetime, _session: Optional[AsyncSession] = None
+    user_id: str, expire_time: timedelta, _session: Optional[AsyncSession] = None
 ):
-    return format_session(await _create_session(user_id, valid_until, _session))
+    return format_session(await _create_session(user_id, expire_time, _session))
 
 
 # Get
