@@ -67,5 +67,5 @@ def update(
     return decorator
 
 
-async def invalidate(cache_key: str, *cache_keys: list[str]):
+async def invalidate(cache_key: str, *cache_keys: str):
     return await client.delete(cache_key, *cache_key)
