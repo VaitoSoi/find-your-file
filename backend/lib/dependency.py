@@ -1,9 +1,9 @@
 from typing import Annotated
 
-from fastapi import Cookie
+from fastapi import Cookie, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .db import get_session, get_user_session
+from .db import SlicedUser, get_session, get_user_session
 from .execption import SessionNotFound, UserNotFound
 
 
@@ -13,3 +13,11 @@ async def get_user(session_id: Annotated[str, Cookie()], session: Annotated[Asyn
         return user_session.user
     except (SessionNotFound, UserNotFound):
         return None
+    
+async def require_user(user: Annotated[SlicedUser, Depends(get_user)]):
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "no auth cookie"}
+        )
+    return user
