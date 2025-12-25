@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "aiosqlite>=0.22.0",
     "argon2-cffi>=25.1.0",
+    "dotenv>=0.9.9",
     "fastapi[standard]>=0.124.4",
     "minio>=7.2.20",
     "redis[hiredis]>=7.1.0",
@@ -24,3 +25,9 @@ extend-select = ["I"]  # Enables import sorting
 known-first-party = ["lib", "enums", "hash", "errors", "db"]
 combine-as-imports = true
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[dependency-groups]
+dev = [
+    "asyncpg>=0.31.0",
+    "dotenv>=0.9.9",
+]
