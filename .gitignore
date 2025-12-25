@@ -20,3 +20,4 @@ wheels/
 
 # local data
 config/
+.env
