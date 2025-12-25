@@ -82,6 +82,7 @@ async def api_update_user(
     return await update_user(user.id, new_user)
 
 
-@router.delete("/", summary="Delete this user")
+@router.delete("/", summary="Delete this user", responses={200: MESSAGE_OK()})
 async def api_delete_user(user: Annotated[SlicedUser, Depends(require_user)]):
-    return await delete_user(user.id)
+    await delete_user(user.id)
+    return {"message": "ok"}
