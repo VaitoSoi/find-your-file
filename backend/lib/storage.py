@@ -16,7 +16,11 @@ client = Minio(
 )
 
 
-async def create_presigned(id: str):
+async def object_info(id: str):
+    return await to_thread(client.stat_object, bucket_name=BUCKET_NAME, object_name=id)
+
+
+async def add_object(id: str):
     presigned_url = await to_thread(
         client.presigned_put_object,
         bucket_name=BUCKET_NAME,
@@ -25,16 +29,18 @@ async def create_presigned(id: str):
     )
     return presigned_url
 
-async def get_presigned(id: str):
+
+async def get_object(id: str):
     presigned_url = await to_thread(
         client.presigned_get_object,
         bucket_name=BUCKET_NAME,
         object_name=id,
-        expires=timedelta(hours=6)
+        expires=timedelta(hours=6),
     )
     return presigned_url
 
-async def delete(id: str):
+
+async def delete_object(id: str):
     await to_thread(
         client.remove_object,
         bucket_name=BUCKET_NAME,
