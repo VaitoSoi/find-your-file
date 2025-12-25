@@ -13,7 +13,6 @@ T = TypeVar("T")
 
 client = Redis.from_url(REDIS_URL)
 
-
 def cache(
     cache_key: str,
     base_class: type[T],
