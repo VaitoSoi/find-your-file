@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta
 from enum import Enum as PyEnum
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Awaitable, Callable, Optional, TypeVar, cast
 from uuid import uuid4
 
+# from sqlalchemy import event
 from pydantic import BaseModel, Field as PydanticField
-from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import aliased
 from sqlmodel import (
@@ -15,6 +15,7 @@ from sqlmodel import (
     Field as SQLField,
     Relationship,
     SQLModel,
+    and_,
     col,
     func,
     select,
@@ -31,6 +32,7 @@ from .execption import (
     UserNotFound,
 )
 from .hash import hash, verify
+from .storage import delete_object, object_info
 
 """
 Object-related models
@@ -55,8 +57,14 @@ class EntryPermission(PyEnum):
     other = "other"
 
 
+class EntryStatus(PyEnum):
+    pending = "pending"
+    finalized = "finalized"
+
+
 class TransactionAction(PyEnum):
     add = "add"
+    finalize = "finalize"
     remove = "remove"  # just marked as delete, file still in bucket
     restore = "restore"  # remove the "deleted" labe;
     delete = "delete"  # actually delete file
@@ -70,7 +78,10 @@ class Entry(SQLModel, table=True):
     id: str = SQLField(primary_key=True, default_factory=lambda: uuid4().__str__())
     name: str
     size: int = SQLField(default=0)
-    type: EntryType = SQLField(sa_column=SQLEnum(EntryType))
+    type: EntryType = SQLField(sa_column=Column(SQLEnum(EntryType)))
+    status: EntryStatus = SQLField(
+        default=EntryStatus.pending, sa_column=Column(SQLEnum(EntryStatus))
+    )
 
     author_id: str = SQLField(foreign_key="user.id", ondelete="CASCADE")
     author: "User" = Relationship(back_populates="entries")
@@ -86,7 +97,7 @@ class Entry(SQLModel, table=True):
     is_deleted_since: Optional[datetime] = SQLField(default=None)
 
     permission: EntryPermission = SQLField(
-        default=EntryPermission.private, sa_column=SQLEnum(EntryPermission)
+        default=EntryPermission.private, sa_column=Column(SQLEnum(EntryPermission))
     )
     permission_inclusive: list[str] = SQLField(
         default=[], sa_column=Column(JSON)
@@ -104,6 +115,7 @@ class SlicedEntry(BaseModel):
     name: str
     type: EntryType
     size: int
+    status: EntryStatus
     author_id: str
     parent_id: Optional[str] = PydanticField(default=None)
 
@@ -127,7 +139,7 @@ class UpdateEntry(BaseModel):
 class Transaction(SQLModel, table=True):
     __tablename__ = "transaction"  # pyright: ignore[reportAssignmentType]
 
-    id: str = SQLField(foreign_key=True, default_factory=lambda: uuid4().__str__())
+    id: str = SQLField(primary_key=True, default_factory=lambda: uuid4().__str__())
 
     entry_id: str = SQLField(foreign_key="entry.id", ondelete="CASCADE")
     entry: Entry = Relationship(back_populates="transactions")
@@ -135,7 +147,7 @@ class Transaction(SQLModel, table=True):
     actor_id: str = SQLField(foreign_key="user.id", ondelete="CASCADE")
     actor: "User" = Relationship()  # who do this transaction
 
-    action: TransactionAction = SQLField(sa_column=SQLEnum(TransactionAction))
+    action: TransactionAction = SQLField(sa_column=Column(SQLEnum(TransactionAction)))
 
     created_at: datetime = SQLField(default_factory=lambda: datetime.now())
 
@@ -226,11 +238,11 @@ Database connection
 engine = create_async_engine(DB_URL)
 
 
-@event.listens_for(engine.sync_engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON;")
-    cursor.close()
+# @event.listens_for(engine.sync_engine, "connect")
+# def set_sqlite_pragma(dbapi_connection, connection_record):
+#     cursor = dbapi_connection.cursor()
+#     cursor.execute("PRAGMA foreign_keys=ON;")
+#     cursor.close()
 
 
 async def init():
@@ -272,6 +284,7 @@ def format_entry(entry: Entry):
         name=entry.name,
         type=entry.type,
         size=entry.size,
+        status=entry.status,
         author_id=entry.author_id,
         parent_id=entry.parent_id,
         is_deleted=entry.is_deleted,
@@ -300,19 +313,24 @@ async def _get_entries(
     parent_id: Optional[str] = None,
     _session: Optional[AsyncSession] = None,
 ):
-    cache_key = "Entries"
+    cache_key = f"Entries#user={author_id}"
     if all:
         cache_key += "#all"
     if parent_id:
         cache_key += f"#parent={parent_id}"
+
     @cache(cache_key=cache_key, base_class=list[Entry])
     async def _inner(session: AsyncSession):
-        statement = select(Entry).where(Entry.author_id == author_id)
+        conditions = [
+            Entry.author_id == author_id,
+            Entry.status == EntryStatus.finalized,
+        ]
         if not all:
-            statement = statement.where(Entry.is_deleted == False)  # noqa: E712
+            conditions.append(Entry.is_deleted == False)  # noqa: E712
         if parent_id:
             await _get_entry(parent_id)
-            statement = statement.where(Entry.parent_id == parent_id)
+            conditions.append(Entry.parent_id == parent_id)
+        statement = select(Entry).where(and_(*conditions))
         return list((await session.execute(statement)).scalars().all())
 
     return await create_session_and_run(_inner, _session)
@@ -360,13 +378,21 @@ async def _add_entry(
     @update_cache(cache_key=f"Entry:{entry_id}")
     async def _inner(session: AsyncSession):
         entry = Entry(
-            id=entry_id, name=name, type=type, author_id=author_id, parent_id=parent_id
+            id=entry_id,
+            name=name,
+            type=type,
+            author_id=author_id,
+            parent_id=parent_id,
+            status=EntryStatus.finalized
+            if type == EntryType.directory
+            else EntryStatus.pending,
         )
         transaction = Transaction(
             entry_id=entry_id, actor_id=author_id, action=TransactionAction.add
         )
         session.add_all([entry, transaction])
         await session.commit()
+        await invalidate(f"Entries#user={entry.author_id}")
         return (entry, transaction)
 
     return await create_session_and_run(_inner, _session)
@@ -405,6 +431,7 @@ async def _update_entry(
 
         session.add_all([entry, transaction])
         await session.commit()
+        await invalidate(f"Entries#user={entry.author_id}")
         return entry
 
     return await create_session_and_run(_inner, _session)
@@ -446,6 +473,7 @@ async def _remove_entry(
         session.add(transaction)
 
         await session.commit()
+        await invalidate(f"Entries#user={entry.author_id}")
         return (entry, transaction)
 
     return await create_session_and_run(_inner, _session)
@@ -456,9 +484,7 @@ async def remove_entry(id: str, actor_id: str, _session: Optional[AsyncSession] 
 
 
 # Remove "deleted" label
-async def _restore_entry(
-    id: str, actor_id: str, _session: Optional[AsyncSession] = None
-):
+async def _restore_entry(id: str, _session: Optional[AsyncSession] = None):
     @update_cache(cache_key=f"Entry:{id}")
     async def _inner(session: AsyncSession):
         entry = await _get_entry(id, session)
@@ -480,24 +506,25 @@ async def _restore_entry(
         await session.execute(statement)
 
         transaction = Transaction(
-            action=TransactionAction.restore, entry_id=entry.id, actor_id=actor_id
+            action=TransactionAction.restore,
+            entry_id=entry.id,
+            actor_id=entry.author_id,
         )
         session.add(transaction)
 
         await session.commit()
+        await invalidate(f"Entries#user={entry.author_id}")
         return (entry, transaction)
 
     return await create_session_and_run(_inner, _session)
 
 
-async def restore_entry(
-    id: str, actor_id: str, _session: Optional[AsyncSession] = None
-):
-    return format_entry((await _restore_entry(id, actor_id, _session))[0])
+async def restore_entry(id: str, _session: Optional[AsyncSession] = None):
+    return format_entry((await _restore_entry(id, _session))[0])
 
 
 # Actually delete
-async def delete_entry(id: str, actor_id: str, _session: Optional[AsyncSession] = None):
+async def delete_entry(id: str, actor_id: str, remove_object: bool = False, _session: Optional[AsyncSession] = None):
     async def _inner(session: AsyncSession):
         entry = await _get_entry(id)
         transaction = Transaction(
@@ -505,10 +532,37 @@ async def delete_entry(id: str, actor_id: str, _session: Optional[AsyncSession] 
         )
         session.add(transaction)
         await session.delete(entry)
+        if remove_object:
+            await delete_object(entry.id)
+        await invalidate(f"Entry:{id}", f"Entries#user={entry.author_id}")
         await session.commit()
-        await invalidate(f"Entry:{id}", "Entryies*")
 
     return await create_session_and_run(_inner, _session)
+
+
+# Util
+async def _finalize(id: str, _session: Optional[AsyncSession] = None):
+    @update_cache(cache_key=f"Entry:{id}")
+    async def _inner(session: AsyncSession):
+        entry = await _get_entry(id, session)
+        metadata = await object_info(entry.id)
+        entry.size = metadata.size or 0
+        entry.status = EntryStatus.finalized
+
+        transaction = Transaction(
+            action=TransactionAction.finalize, actor_id=entry.id, entry_id=entry.id
+        )
+
+        session.add_all([entry, transaction])
+        await session.commit()
+        await invalidate(f"Entries#user={entry.author_id}")
+        return entry
+
+    return await create_session_and_run(_inner, _session)
+
+
+async def finalize(id: str, _session: Optional[AsyncSession] = None):
+    return format_entry(await _finalize(id, _session))
 
 
 """
@@ -528,7 +582,6 @@ def format_user(user: User):
 
 # Get all
 async def _get_users(_session: Optional[AsyncSession] = None):
-    @cache("Users", list[User])
     async def _inner(session: AsyncSession):
         statement = select(User)
         return list((await session.execute(statement)).scalars().all())
@@ -639,9 +692,14 @@ async def login(username: str, password: str, session: Optional[AsyncSession] = 
 
 
 async def can_see_entry(
-    user_id: str, entry_id: str, session: Optional[AsyncSession] = None
+    user_id: str,
+    entry_id: Optional[str] = None,
+    entry: Optional[SlicedEntry] = None,
+    session: Optional[AsyncSession] = None,
 ):
-    entry = await _get_entry(entry_id, session)
+    entry = entry or await get_entry(cast(str, entry_id), session)
+    if entry is None:
+        raise ValueError()
 
     if (
         entry.permission == EntryPermission.public
